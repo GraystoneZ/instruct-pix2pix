@@ -33,6 +33,6 @@ dependencies:
     - -e git+https://github.com/CompVis/taming-transformers.git@master#egg=taming-transformers
     - -e git+https://github.com/openai/CLIP.git@main#egg=clip
     - openai
-    - gradio
+    - gradio==3.17.0
     - seaborn
-    - git+https://github.com/crowsonkb/k-diffusion.git
+    - git+https://github.com/crowsonkb/k-diffusion.git@v0.0.12
