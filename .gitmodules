@@ -1,0 +1,3 @@
+[submodule "SyncDiffusion"]
+	path = SyncDiffusion
+	url = https://github.com/GraystoneZ/SyncDiffusion.git
