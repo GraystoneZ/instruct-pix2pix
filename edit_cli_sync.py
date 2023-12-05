@@ -21,6 +21,11 @@ sys.path.append("./stable_diffusion")
 
 from stable_diffusion.ldm.util import instantiate_from_config
 
+# Added for SyncDiffusion
+from SyncDiffusion.syncdiffusion.utils import exponential_decay_list
+from stable_diffusion.ldm.models.diffusion.ddim import DDIMSampler
+import lpips
+
 
 class CFGDenoiser(nn.Module):
     def __init__(self, model):
@@ -75,6 +80,10 @@ def main():
     parser.add_argument("--cfg-text", default=7.5, type=float)
     parser.add_argument("--cfg-image", default=1.5, type=float)
     parser.add_argument("--seed", type=int)
+    parser.add_argument("--sync_weight", default=20, type=float)    # Added for SyncDiffusion
+    parser.add_argument("--sync_freq", default=1, type=int)    # Added for SyncDiffusion
+    parser.add_argument("--sync_thres", default=100, type=int)    # Added for SyncDiffusion
+    parser.add_argument("--sync_decay_rate", default=0.95, type=float)    # Added for SyncDiffusion
     args = parser.parse_args()
 
     config = OmegaConf.load(args.config)
@@ -83,6 +92,14 @@ def main():
     model_wrap = K.external.CompVisDenoiser(model)
     model_wrap_cfg = CFGDenoiser(model_wrap)
     null_token = model.get_learned_conditioning([""])
+    
+    # load perceptual loss (LPIPS)
+    percept_loss = lpips.LPIPS(net='vgg').to(model.device)
+    print(f'[INFO] loaded perceptual loss!')
+
+    # DDIM sampler
+    ddim_sampler = DDIMSampler(model)
+    ddim_sampler.make_schedule(args.steps)
 
     seed = random.randint(0, 100000) if args.seed is None else args.seed
     input_image = Image.open(args.input).convert("RGB")
@@ -97,32 +114,42 @@ def main():
         input_image.save(args.output)
         return
 
-    with torch.no_grad(), autocast("cuda"), model.ema_scope():
-        cond = {}
-        cond["c_crossattn"] = [model.get_learned_conditioning([args.edit])]
-        input_image = 2 * torch.tensor(np.array(input_image)).float() / 255 - 1
-        input_image = rearrange(input_image, "h w c -> 1 c h w").to(model.device)
-        cond["c_concat"] = [model.encode_first_stage(input_image).mode()]
+    with torch.autocast("cuda"), model.ema_scope():
+        with torch.no_grad():
+            cond = {}
+            cond["c_crossattn"] = [model.get_learned_conditioning([args.edit])]
+            cond_image = 2 * torch.tensor(np.array(input_image)).float() / 255 - 1
+            cond_image = rearrange(cond_image, "h w c -> 1 c h w").to(model.device)
+            cond["c_concat"] = [model.encode_first_stage(cond_image).mode()]
 
-        uncond = {}
-        uncond["c_crossattn"] = [null_token]
-        uncond["c_concat"] = [torch.zeros_like(cond["c_concat"][0])]
+            uncond = {}
+            uncond["c_crossattn"] = [null_token]
+            uncond["c_concat"] = [torch.zeros_like(cond["c_concat"][0])]
 
-        sigmas = model_wrap.get_sigmas(args.steps)
+            sigmas = model_wrap.get_sigmas(args.steps)
 
-        extra_args = {
-            "cond": cond,
-            "uncond": uncond,
-            "text_cfg_scale": args.cfg_text,
-            "image_cfg_scale": args.cfg_image,
-        }
-        torch.manual_seed(seed)
-        z = torch.randn_like(cond["c_concat"][0]) * sigmas[0]
-        z = sample_euler_ancestral(model_wrap_cfg, z, sigmas, extra_args=extra_args)
-        x = model.decode_first_stage(z)
-        x = torch.clamp((x + 1.0) / 2.0, min=0.0, max=1.0)
-        x = 255.0 * rearrange(x, "1 c h w -> h w c")
-        edited_image = Image.fromarray(x.type(torch.uint8).cpu().numpy())
+            extra_args = {
+                "cond": cond,
+                "uncond": uncond,
+                "text_cfg_scale": args.cfg_text,
+                "image_cfg_scale": args.cfg_image,
+            }
+            torch.manual_seed(seed)
+
+            # Added for SyncDiffusion
+            sync_scheduler = exponential_decay_list(init_weight=args.sync_weight,
+                                                    decay_rate=args.sync_decay_rate,
+                                                    num_steps=args.steps)
+        
+        # For SyncDiffusion, we need grad of z, so we disable torch.no_grad()
+        z = torch.randn_like(cond["c_concat"][0], requires_grad=True) * sigmas[0]
+        # z = sample_euler_ancestral(model_wrap_cfg, z, sigmas, extra_args=extra_args)
+
+        with torch.no_grad():
+            x = model.decode_first_stage(z)
+            x = torch.clamp((x + 1.0) / 2.0, min=0.0, max=1.0)
+            x = 255.0 * rearrange(x, "1 c h w -> h w c")
+            edited_image = Image.fromarray(x.type(torch.uint8).cpu().numpy())
     edited_image.save(args.output)
 
 @torch.no_grad()
