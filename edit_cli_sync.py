@@ -99,7 +99,13 @@ def main():
 
     # DDIM sampler
     ddim_sampler = DDIMSampler(model)
-    ddim_sampler.make_schedule(args.steps)
+    with torch.no_grad():
+        ddim_sampler.make_schedule(args.steps)
+    
+    # Added for SyncDiffusion
+    sync_scheduler = exponential_decay_list(init_weight=args.sync_weight,
+                                            decay_rate=args.sync_decay_rate,
+                                            num_steps=args.steps)
 
     seed = random.randint(0, 100000) if args.seed is None else args.seed
     input_image = Image.open(args.input).convert("RGB")
@@ -135,22 +141,44 @@ def main():
                 "image_cfg_scale": args.cfg_image,
             }
             torch.manual_seed(seed)
+            
 
-            # Added for SyncDiffusion
-            sync_scheduler = exponential_decay_list(init_weight=args.sync_weight,
-                                                    decay_rate=args.sync_decay_rate,
-                                                    num_steps=args.steps)
         
         # For SyncDiffusion, we need grad of z, so we disable torch.no_grad()
         z = torch.randn_like(cond["c_concat"][0], requires_grad=True) * sigmas[0]
         # z = sample_euler_ancestral(model_wrap_cfg, z, sigmas, extra_args=extra_args)
+
+        # Test : Sampling with DDIM instead of Euler a
+        
+        timesteps = ddim_sampler.ddim_timesteps
+        intermediates = {'z_inter': [z], 'pred_z0': [z]}
+        time_range = np.flip(timesteps)
+        total_steps = timesteps.shape[0]
+        print(f"Running DDIM Sampling with {total_steps} timesteps")
+        
+        iterator = tqdm(time_range, desc='DDIM Sampler', total=total_steps)
+
+        log_every_t = 10
+        b = 1
+        with torch.no_grad():
+            for i, step in enumerate(iterator):
+                index = total_steps - i - 1
+                ts = torch.full((b,), step, device=model.device, dtype=torch.long)
+
+                outs = ddim_sampler.p_sample_ddim_edit(x=z, cond=cond, uncond=uncond, text_cfg_scale=args.cfg_text, image_cfg_scale=args.cfg_image, t=ts, index=index)
+                z, pred_z0 = outs
+
+                if index % log_every_t == 0 or index == total_steps - 1:
+                    intermediates['z_inter'].append(z)
+                    intermediates['pred_z0'].append(pred_z0)
+
 
         with torch.no_grad():
             x = model.decode_first_stage(z)
             x = torch.clamp((x + 1.0) / 2.0, min=0.0, max=1.0)
             x = 255.0 * rearrange(x, "1 c h w -> h w c")
             edited_image = Image.fromarray(x.type(torch.uint8).cpu().numpy())
-    edited_image.save(args.output)
+            edited_image.save(args.output)
 
 @torch.no_grad()
 def sample_euler_ancestral(model, x, sigmas, extra_args=None, callback=None, disable=None, eta=1., s_noise=1., noise_sampler=None):
